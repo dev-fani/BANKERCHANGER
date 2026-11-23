@@ -63,4 +63,122 @@ export class StellarIndexer {
         logger.debug(`Unhandled event: ${String(eventName)}`);
     }
   }
+
+  /**
+   * Backfill historical ledger ranges in ascending order, processing in
+   * bounded batches to avoid OOM. Events are deduplicated via ON CONFLICT
+   * DO UPDATE, and the checkpoint is only advanced after the final ledger.
+   */
+  async backfillLedgerRange(
+    fromLedger: number,
+    toLedger: number,
+    batchSize: number
+  ): Promise<void> {
+    if (fromLedger > toLedger) {
+      throw new Error(
+        `Invalid ledger range: fromLedger (${fromLedger}) > toLedger (${toLedger})`
+      );
+    }
+    if (batchSize <= 0) {
+      throw new Error(`Invalid batchSize: ${batchSize}`);
+    }
+
+    logger.info(
+      `Starting backfill from ledger ${fromLedger} to ${toLedger} (batchSize=${batchSize})`
+    );
+
+    let processed = 0;
+
+    for (let start = fromLedger; start <= toLedger; start += batchSize) {
+      const end = Math.min(start + batchSize - 1, toLedger);
+
+      // Fetch events for this bounded ledger window only, keeping memory
+      // usage proportional to batchSize rather than the full range.
+      const events = await this.fetchEventsForRange(start, end);
+
+      for (const event of events) {
+        await this.persistEventDeduped(event);
+      }
+
+      processed += end - start + 1;
+
+      if (processed % 1000 === 0 || end === toLedger) {
+        logger.info(
+          `Backfill progress: processed up to ledger ${end} (${processed} ledgers)`
+        );
+      }
+    }
+
+    // Checkpoint is only updated after the final ledger has been processed.
+    await this.updateCheckpoint(toLedger);
+
+    logger.info(`Backfill complete. Checkpoint updated to ledger ${toLedger}`);
+  }
+
+  private async fetchEventsForRange(
+    startLedger: number,
+    endLedger: number
+  ): Promise<SorobanRpc.Api.EventResponse[]> {
+    const events: SorobanRpc.Api.EventResponse[] = [];
+    let cursor: string | undefined;
+
+    do {
+      const response = await this.server.getEvents({
+        startLedger,
+        filters: [
+          {
+            type: 'contract',
+            contractIds: [this.contractId],
+          },
+        ],
+        cursor,
+        limit: 200,
+      });
+
+      for (const event of response.events) {
+        if (event.ledger <= endLedger) {
+          events.push(event);
+        }
+      }
+
+      cursor = response.cursor;
+      if (response.events.length === 0) {
+        break;
+      }
+    } while (cursor);
+
+    return events;
+  }
+
+  private async persistEventDeduped(
+    event: SorobanRpc.Api.EventResponse
+  ): Promise<void> {
+    const topics = event.topic.map((t) => scValToNative(t));
+    const eventName = String(topics[0]);
+    const data = scValToNative(event.value) as Record<string, unknown>;
+
+    // Deduplicate on the unique (tx_hash, event_index) key so re-running a
+    // backfill never inserts duplicate rows.
+    await prisma.$executeRaw`
+      INSERT INTO "IndexedEvent" ("tx_hash", "event_index", "ledger", "event_name", "payload", "created_at")
+      VALUES (${event.txHash}, ${event.id}, ${event.ledger}, ${eventName}, ${JSON.stringify(
+        data,
+        (_k, v) => (typeof v === 'bigint' ? v.toString() : v)
+      )}::jsonb, NOW())
+      ON CONFLICT ("tx_hash", "event_index") DO UPDATE
+      SET "ledger" = EXCLUDED."ledger",
+          "event_name" = EXCLUDED."event_name",
+          "payload" = EXCLUDED."payload"
+    `;
+  }
+
+  private async updateCheckpoint(ledger: number): Promise<void> {
+    await prisma.$executeRaw`
+      INSERT INTO "IndexerCheckpoint" ("id", "last_ledger", "updated_at")
+      VALUES ('default', ${ledger}, NOW())
+      ON CONFLICT ("id") DO UPDATE
+      SET "last_ledger" = EXCLUDED."last_ledger",
+          "updated_at" = EXCLUDED."updated_at"
+    `;
+  }
 }
